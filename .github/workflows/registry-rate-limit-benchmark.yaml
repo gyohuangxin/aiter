@@ -33,6 +33,21 @@ on:
         required: false
         default: ""
         type: string
+      drain_dockerhub_before_burst:
+        description: Send sequential manifest requests to Docker Hub before the burst so the remaining quota is easier to exhaust
+        required: false
+        default: true
+        type: boolean
+      drain_target_remaining:
+        description: Stop draining once Docker Hub rate-limit remaining reaches this value or lower
+        required: true
+        default: "5"
+        type: string
+      drain_max_requests:
+        description: Maximum manifest requests to spend while draining the Docker Hub rate-limit bucket
+        required: true
+        default: "250"
+        type: string
       fail_on_pull_error:
         description: Mark the workflow failed when any pull fails or is rate-limited
         required: false
@@ -58,6 +73,9 @@ jobs:
       PARALLEL_PULLS: ${{ inputs.parallel_pulls }}
       STARTUP_DELAY_SECONDS: ${{ inputs.startup_delay_seconds }}
       PULL_TIMEOUT_SECONDS: ${{ inputs.pull_timeout_seconds }}
+      DRAIN_DOCKERHUB_BEFORE_BURST: ${{ inputs.drain_dockerhub_before_burst }}
+      DRAIN_TARGET_REMAINING: ${{ inputs.drain_target_remaining }}
+      DRAIN_MAX_REQUESTS: ${{ inputs.drain_max_requests }}
       FAIL_ON_PULL_ERROR: ${{ inputs.fail_on_pull_error }}
     steps:
       - name: Install skopeo
@@ -91,16 +109,36 @@ jobs:
                   raise SystemExit(f"{name} must be >= 1, got {value}")
               return value
 
+          def parse_non_negative_int(name: str) -> int:
+              raw = os.environ[name]
+              try:
+                  value = int(raw)
+              except ValueError as exc:
+                  raise SystemExit(f"{name} must be an integer, got {raw!r}") from exc
+              if value < 0:
+                  raise SystemExit(f"{name} must be >= 0, got {value}")
+              return value
+
           parallel_pulls = parse_positive_int("PARALLEL_PULLS")
           startup_delay_seconds = parse_positive_int("STARTUP_DELAY_SECONDS")
           pull_timeout_seconds = parse_positive_int("PULL_TIMEOUT_SECONDS")
+          drain_target_remaining = parse_non_negative_int("DRAIN_TARGET_REMAINING")
+          drain_max_requests = parse_positive_int("DRAIN_MAX_REQUESTS")
+          drain_enabled = os.environ["DRAIN_DOCKERHUB_BEFORE_BURST"].strip().lower()
 
           if parallel_pulls > 200:
               raise SystemExit("PARALLEL_PULLS must be <= 200 to avoid accidental quota spikes")
+          if drain_enabled not in {"true", "false"}:
+              raise SystemExit(
+                  f"DRAIN_DOCKERHUB_BEFORE_BURST must be true or false, got {drain_enabled!r}"
+              )
 
           print(f"PARALLEL_PULLS={parallel_pulls}")
           print(f"STARTUP_DELAY_SECONDS={startup_delay_seconds}")
           print(f"PULL_TIMEOUT_SECONDS={pull_timeout_seconds}")
+          print(f"DRAIN_DOCKERHUB_BEFORE_BURST={drain_enabled}")
+          print(f"DRAIN_TARGET_REMAINING={drain_target_remaining}")
+          print(f"DRAIN_MAX_REQUESTS={drain_max_requests}")
           PY
 
       - name: Log in to GHCR
@@ -254,6 +292,264 @@ jobs:
           )
           PY
 
+          cat <<'PY' > "$GITHUB_WORKSPACE/registry-benchmark-results/dockerhub_rate_limit.py"
+          import json
+          import pathlib
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          ACCEPT_HEADER = ",".join(
+              [
+                  "application/vnd.docker.distribution.manifest.v2+json",
+                  "application/vnd.oci.image.manifest.v1+json",
+              ]
+          )
+
+
+          def parse_rate_value(raw: str | None) -> int | None:
+              if not raw:
+                  return None
+              match = re.search(r"(\d+)", raw)
+              return int(match.group(1)) if match else None
+
+
+          def parse_dockerhub_image(image: str) -> tuple[str, str]:
+              reference = image.removeprefix("docker://")
+              if "@" in reference:
+                  name, manifest_ref = reference.rsplit("@", 1)
+              else:
+                  last_slash = reference.rfind("/")
+                  last_colon = reference.rfind(":")
+                  if last_colon > last_slash:
+                      name, manifest_ref = reference[:last_colon], reference[last_colon + 1 :]
+                  else:
+                      name, manifest_ref = reference, "latest"
+
+              parts = name.split("/")
+              if "." in parts[0] or ":" in parts[0] or parts[0] == "localhost":
+                  registry = parts[0]
+                  repository = "/".join(parts[1:])
+              else:
+                  registry = "docker.io"
+                  repository = name
+
+              if registry not in {"docker.io", "registry-1.docker.io", "index.docker.io"}:
+                  raise SystemExit(
+                      f"dockerhub_rate_limit.py only supports docker.io images, got {image!r}"
+                  )
+
+              if "/" not in repository:
+                  repository = f"library/{repository}"
+
+              return repository, manifest_ref
+
+
+          def request_token(repository: str) -> str:
+              query = urllib.parse.urlencode(
+                  {
+                      "service": "registry.docker.io",
+                      "scope": f"repository:{repository}:pull",
+                  }
+              )
+              url = f"https://auth.docker.io/token?{query}"
+              with urllib.request.urlopen(url, timeout=60) as response:
+                  return json.load(response)["token"]
+
+
+          def extract_header(headers: dict[str, str], wanted_key: str) -> str | None:
+              for key, value in headers.items():
+                  if key.lower() == wanted_key:
+                      return value
+              return None
+
+
+          def snapshot(image: str) -> dict:
+              repository, manifest_ref = parse_dockerhub_image(image)
+              token = request_token(repository)
+              url = f"https://registry-1.docker.io/v2/{repository}/manifests/{manifest_ref}"
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": ACCEPT_HEADER,
+                  },
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      body = response.read().decode("utf-8", errors="replace")
+                      headers = dict(response.headers.items())
+                      status_code = response.status
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", errors="replace")
+                  headers = dict(exc.headers.items())
+                  status_code = exc.code
+              except urllib.error.URLError as exc:
+                  return {
+                      "image": image,
+                      "repository": repository,
+                      "manifest_ref": manifest_ref,
+                      "status_code": None,
+                      "limit": None,
+                      "remaining": None,
+                      "source": None,
+                      "limit_raw": None,
+                      "remaining_raw": None,
+                      "body_excerpt": str(exc),
+                      "rate_limited": False,
+                  }
+
+              limit_raw = extract_header(headers, "ratelimit-limit")
+              remaining_raw = extract_header(headers, "ratelimit-remaining")
+              source_raw = extract_header(headers, "docker-ratelimit-source")
+
+              return {
+                  "image": image,
+                  "repository": repository,
+                  "manifest_ref": manifest_ref,
+                  "status_code": status_code,
+                  "limit": parse_rate_value(limit_raw),
+                  "remaining": parse_rate_value(remaining_raw),
+                  "source": source_raw,
+                  "limit_raw": limit_raw,
+                  "remaining_raw": remaining_raw,
+                  "body_excerpt": body[-2000:],
+                  "rate_limited": status_code == 429 or "toomanyrequests" in body.lower(),
+              }
+
+
+          def write_output(path: str, payload: dict) -> None:
+              output_path = pathlib.Path(path)
+              output_path.parent.mkdir(parents=True, exist_ok=True)
+              output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+          def main() -> None:
+              command = sys.argv[1]
+
+              if command == "snapshot":
+                  image = sys.argv[2]
+                  output_path = sys.argv[3]
+                  write_output(output_path, snapshot(image))
+                  return
+
+              if command == "drain":
+                  image = sys.argv[2]
+                  enabled = sys.argv[3].strip().lower() == "true"
+                  target_remaining = int(sys.argv[4])
+                  max_requests = int(sys.argv[5])
+                  output_path = sys.argv[6]
+
+                  initial = snapshot(image)
+                  final = initial
+                  attempted_requests = 0
+                  skipped_reason = None
+
+                  if not enabled:
+                      skipped_reason = "disabled"
+                  elif initial["remaining"] is None:
+                      skipped_reason = "missing_rate_limit_headers"
+                  elif initial["status_code"] == 429:
+                      skipped_reason = "already_rate_limited"
+                  else:
+                      while (
+                          attempted_requests < max_requests
+                          and final["remaining"] is not None
+                          and final["remaining"] > target_remaining
+                          and final["status_code"] != 429
+                      ):
+                          final = snapshot(image)
+                          attempted_requests += 1
+
+                      if (
+                          final["status_code"] != 429
+                          and final["remaining"] is not None
+                          and final["remaining"] > target_remaining
+                      ):
+                          skipped_reason = "max_requests_reached"
+
+                  payload = {
+                      "enabled": enabled,
+                      "target_remaining": target_remaining,
+                      "max_requests": max_requests,
+                      "attempted_requests": attempted_requests,
+                      "skipped_reason": skipped_reason,
+                      "target_reached": (
+                          final["remaining"] is not None
+                          and final["remaining"] <= target_remaining
+                      ),
+                      "hit_rate_limit_during_drain": final["status_code"] == 429
+                      or final["rate_limited"],
+                      "initial": initial,
+                      "final": final,
+                  }
+                  write_output(output_path, payload)
+                  return
+
+              raise SystemExit(f"Unsupported command: {command}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Drain Docker Hub rate-limit bucket before burst
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/registry-benchmark-results/dockerhub_rate_limit.py" drain \
+            "$DOCKERHUB_IMAGE" \
+            "$DRAIN_DOCKERHUB_BEFORE_BURST" \
+            "$DRAIN_TARGET_REMAINING" \
+            "$DRAIN_MAX_REQUESTS" \
+            "$GITHUB_WORKSPACE/registry-benchmark-results/dockerhub/rate-limit-drain.json"
+
+      - name: Print Docker Hub rate-limit drain result
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path("registry-benchmark-results/dockerhub/rate-limit-drain.json")
+          if not path.exists():
+              print("Docker Hub drain result file is missing.")
+              raise SystemExit(0)
+
+          payload = json.loads(path.read_text(encoding="utf-8"))
+
+          def snapshot_line(label: str, snapshot: dict | None) -> str:
+              if not snapshot:
+                  return f"{label}: unavailable"
+              return (
+                  f"{label}: status={snapshot.get('status_code', 'unknown')}, "
+                  f"limit={snapshot.get('limit', 'unknown')}, "
+                  f"remaining={snapshot.get('remaining', 'unknown')}, "
+                  f"source={snapshot.get('source') or 'unknown'}"
+              )
+
+          print("Docker Hub rate-limit drain result")
+          print(
+              "settings: "
+              f"enabled={payload.get('enabled')}, "
+              f"target_remaining={payload.get('target_remaining')}, "
+              f"max_requests={payload.get('max_requests')}"
+          )
+          print(
+              "outcome: "
+              f"attempted_requests={payload.get('attempted_requests')}, "
+              f"target_reached={payload.get('target_reached')}, "
+              f"hit_rate_limit_during_drain={payload.get('hit_rate_limit_during_drain')}, "
+              f"skipped_reason={payload.get('skipped_reason') or 'none'}"
+          )
+          print(snapshot_line("before drain", payload.get("initial")))
+          print(snapshot_line("after drain", payload.get("final")))
+          PY
+
       - name: Run Docker Hub burst
         shell: bash
         run: |
@@ -265,6 +561,42 @@ jobs:
             "$PARALLEL_PULLS" \
             "$STARTUP_DELAY_SECONDS" \
             "$PULL_TIMEOUT_SECONDS"
+
+      - name: Capture Docker Hub rate-limit after burst
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/registry-benchmark-results/dockerhub_rate_limit.py" snapshot \
+            "$DOCKERHUB_IMAGE" \
+            "$GITHUB_WORKSPACE/registry-benchmark-results/dockerhub/rate-limit-after-burst.json"
+
+      - name: Print Docker Hub rate-limit after burst
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path("registry-benchmark-results/dockerhub/rate-limit-after-burst.json")
+          if not path.exists():
+              print("Docker Hub post-burst rate-limit file is missing.")
+              raise SystemExit(0)
+
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          print("Docker Hub rate-limit after burst")
+          print(
+              f"status={payload.get('status_code', 'unknown')}, "
+              f"limit={payload.get('limit', 'unknown')}, "
+              f"remaining={payload.get('remaining', 'unknown')}, "
+              f"source={payload.get('source') or 'unknown'}"
+          )
+          if payload.get("rate_limited"):
+              excerpt = (payload.get("body_excerpt") or "").strip()
+              if excerpt:
+                  print(f"body_excerpt={excerpt[-500:]}")
+          PY
 
       - name: Run GHCR burst
         shell: bash
@@ -292,11 +624,19 @@ jobs:
           parallel_pulls = int(os.environ["PARALLEL_PULLS"])
           startup_delay_seconds = int(os.environ["STARTUP_DELAY_SECONDS"])
           fail_on_pull_error = os.environ["FAIL_ON_PULL_ERROR"].lower() == "true"
+          drain_enabled = os.environ["DRAIN_DOCKERHUB_BEFORE_BURST"].lower() == "true"
+          drain_target_remaining = int(os.environ["DRAIN_TARGET_REMAINING"])
+          drain_max_requests = int(os.environ["DRAIN_MAX_REQUESTS"])
 
           def load_results(registry: str) -> list[dict]:
               path = results_root / registry / "results.json"
               if not path.exists():
                   return []
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          def load_json(path: pathlib.Path) -> dict | None:
+              if not path.exists():
+                  return None
               return json.loads(path.read_text(encoding="utf-8"))
 
           def pick_excerpt(text: str) -> str:
@@ -346,6 +686,12 @@ jobs:
 
           dockerhub_records = load_results("dockerhub")
           ghcr_records = load_results("ghcr")
+          dockerhub_drain = load_json(
+              results_root / "dockerhub" / "rate-limit-drain.json"
+          )
+          dockerhub_after_burst = load_json(
+              results_root / "dockerhub" / "rate-limit-after-burst.json"
+          )
           dockerhub_stats = summarize(dockerhub_records)
           ghcr_stats = summarize(ghcr_records)
 
@@ -376,6 +722,47 @@ jobs:
               "> This mode keeps both registry bursts on one runner to share the same egress IP while avoiding Docker daemon cache sharing during the pull burst.",
               "",
           ]
+
+          def format_snapshot(label: str, payload: dict | None) -> str:
+              if not payload:
+                  return f"- {label}: unavailable"
+              return (
+                  f"- {label}: status={payload.get('status_code', 'unknown')}, "
+                  f"limit={payload.get('limit', 'unknown')}, "
+                  f"remaining={payload.get('remaining', 'unknown')}, "
+                  f"source=`{payload.get('source') or 'unknown'}`"
+              )
+
+          lines.extend(
+              [
+                  "## Docker Hub Rate-Limit Headers",
+                  format_snapshot(
+                      "After GHCR sync / before drain",
+                      (dockerhub_drain or {}).get("initial"),
+                  ),
+                  format_snapshot(
+                      "After drain",
+                      (dockerhub_drain or {}).get("final"),
+                  ),
+                  format_snapshot("After Docker Hub burst", dockerhub_after_burst),
+                  (
+                      "- Drain settings: "
+                      f"enabled={drain_enabled}, "
+                      f"target_remaining={drain_target_remaining}, "
+                      f"max_requests={drain_max_requests}"
+                  ),
+              ]
+          )
+          if dockerhub_drain:
+              lines.append(
+                  "- Drain outcome: "
+                  f"attempted_requests={dockerhub_drain.get('attempted_requests')}/"
+                  f"{dockerhub_drain.get('max_requests')}, "
+                  f"target_reached={dockerhub_drain.get('target_reached')}, "
+                  f"hit_rate_limit_during_drain={dockerhub_drain.get('hit_rate_limit_during_drain')}, "
+                  f"skipped_reason={dockerhub_drain.get('skipped_reason') or 'none'}"
+              )
+          lines.append("")
 
           def add_failures(title: str, records: list[dict]) -> None:
               failures = [record for record in records if record.get("status") != "success"]
