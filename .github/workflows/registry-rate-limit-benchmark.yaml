@@ -507,6 +507,49 @@ jobs:
             "$DRAIN_MAX_REQUESTS" \
             "$GITHUB_WORKSPACE/registry-benchmark-results/dockerhub/rate-limit-drain.json"
 
+      - name: Print Docker Hub rate-limit drain result
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path("registry-benchmark-results/dockerhub/rate-limit-drain.json")
+          if not path.exists():
+              print("Docker Hub drain result file is missing.")
+              raise SystemExit(0)
+
+          payload = json.loads(path.read_text(encoding="utf-8"))
+
+          def snapshot_line(label: str, snapshot: dict | None) -> str:
+              if not snapshot:
+                  return f"{label}: unavailable"
+              return (
+                  f"{label}: status={snapshot.get('status_code', 'unknown')}, "
+                  f"limit={snapshot.get('limit', 'unknown')}, "
+                  f"remaining={snapshot.get('remaining', 'unknown')}, "
+                  f"source={snapshot.get('source') or 'unknown'}"
+              )
+
+          print("Docker Hub rate-limit drain result")
+          print(
+              "settings: "
+              f"enabled={payload.get('enabled')}, "
+              f"target_remaining={payload.get('target_remaining')}, "
+              f"max_requests={payload.get('max_requests')}"
+          )
+          print(
+              "outcome: "
+              f"attempted_requests={payload.get('attempted_requests')}, "
+              f"target_reached={payload.get('target_reached')}, "
+              f"hit_rate_limit_during_drain={payload.get('hit_rate_limit_during_drain')}, "
+              f"skipped_reason={payload.get('skipped_reason') or 'none'}"
+          )
+          print(snapshot_line("before drain", payload.get("initial")))
+          print(snapshot_line("after drain", payload.get("final")))
+          PY
+
       - name: Run Docker Hub burst
         shell: bash
         run: |
@@ -527,6 +570,33 @@ jobs:
           python3 "$GITHUB_WORKSPACE/registry-benchmark-results/dockerhub_rate_limit.py" snapshot \
             "$DOCKERHUB_IMAGE" \
             "$GITHUB_WORKSPACE/registry-benchmark-results/dockerhub/rate-limit-after-burst.json"
+
+      - name: Print Docker Hub rate-limit after burst
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path("registry-benchmark-results/dockerhub/rate-limit-after-burst.json")
+          if not path.exists():
+              print("Docker Hub post-burst rate-limit file is missing.")
+              raise SystemExit(0)
+
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          print("Docker Hub rate-limit after burst")
+          print(
+              f"status={payload.get('status_code', 'unknown')}, "
+              f"limit={payload.get('limit', 'unknown')}, "
+              f"remaining={payload.get('remaining', 'unknown')}, "
+              f"source={payload.get('source') or 'unknown'}"
+          )
+          if payload.get("rate_limited"):
+              excerpt = (payload.get("body_excerpt") or "").strip()
+              if excerpt:
+                  print(f"body_excerpt={excerpt[-500:]}")
+          PY
 
       - name: Run GHCR burst
         shell: bash
