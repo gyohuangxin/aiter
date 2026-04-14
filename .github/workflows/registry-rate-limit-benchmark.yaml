@@ -126,8 +126,8 @@ jobs:
           drain_max_requests = parse_positive_int("DRAIN_MAX_REQUESTS")
           drain_enabled = os.environ["DRAIN_DOCKERHUB_BEFORE_BURST"].strip().lower()
 
-          if parallel_pulls > 200:
-              raise SystemExit("PARALLEL_PULLS must be <= 200 to avoid accidental quota spikes")
+          if parallel_pulls > 1000:
+              raise SystemExit("PARALLEL_PULLS must be <= 1000 to avoid accidental quota spikes")
           if drain_enabled not in {"true", "false"}:
               raise SystemExit(
                   f"DRAIN_DOCKERHUB_BEFORE_BURST must be true or false, got {drain_enabled!r}"
