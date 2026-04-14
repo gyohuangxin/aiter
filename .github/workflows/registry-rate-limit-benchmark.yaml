@@ -18,6 +18,11 @@ on:
         required: true
         default: "600"
         type: string
+      pull_probe_entrypoint:
+        description: Entrypoint used with docker run --pull always; override if the image does not provide /bin/true
+        required: true
+        default: "/bin/true"
+        type: string
       dockerhub_image:
         description: Docker Hub image to test
         required: true
@@ -104,13 +109,14 @@ jobs:
       max-parallel: ${{ fromJson(needs.prepare-matrix.outputs.max_parallel) }}
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
     steps:
-      - name: Pull Docker Hub image and capture result
+      - name: Force-pull Docker Hub image and capture result
         shell: bash
         env:
           IMAGE: ${{ inputs.dockerhub_image }}
           REGISTRY_NAME: dockerhub
           RUNNER_INDEX: ${{ matrix.runner_index }}
           PULL_TIMEOUT_SECONDS: ${{ needs.prepare-matrix.outputs.pull_timeout_seconds }}
+          PULL_PROBE_ENTRYPOINT: ${{ inputs.pull_probe_entrypoint }}
         run: |
           set +e
           rm -f pull.log "${REGISTRY_NAME}-result-${RUNNER_INDEX}.json"
@@ -119,7 +125,11 @@ jobs:
           started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           start_epoch=$(date +%s)
 
-          timeout "${PULL_TIMEOUT_SECONDS}" docker pull "$IMAGE" 2>&1 | tee pull.log
+          timeout "${PULL_TIMEOUT_SECONDS}" docker run \
+            --pull always \
+            --rm \
+            --entrypoint "${PULL_PROBE_ENTRYPOINT}" \
+            "$IMAGE" 2>&1 | tee pull.log
           pull_exit=${PIPESTATUS[0]}
 
           end_epoch=$(date +%s)
@@ -214,13 +224,14 @@ jobs:
         if: env.GHCR_PAT == ''
         run: echo "GHCR_PAT is not configured; testing anonymous GHCR pull."
 
-      - name: Pull GHCR image and capture result
+      - name: Force-pull GHCR image and capture result
         shell: bash
         env:
           IMAGE: ${{ inputs.ghcr_image }}
           REGISTRY_NAME: ghcr
           RUNNER_INDEX: ${{ matrix.runner_index }}
           PULL_TIMEOUT_SECONDS: ${{ needs.prepare-matrix.outputs.pull_timeout_seconds }}
+          PULL_PROBE_ENTRYPOINT: ${{ inputs.pull_probe_entrypoint }}
         run: |
           set +e
           rm -f pull.log "${REGISTRY_NAME}-result-${RUNNER_INDEX}.json"
@@ -229,7 +240,11 @@ jobs:
           started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           start_epoch=$(date +%s)
 
-          timeout "${PULL_TIMEOUT_SECONDS}" docker pull "$IMAGE" 2>&1 | tee pull.log
+          timeout "${PULL_TIMEOUT_SECONDS}" docker run \
+            --pull always \
+            --rm \
+            --entrypoint "${PULL_PROBE_ENTRYPOINT}" \
+            "$IMAGE" 2>&1 | tee pull.log
           pull_exit=${PIPESTATUS[0]}
 
           end_epoch=$(date +%s)
