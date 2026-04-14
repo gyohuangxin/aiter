@@ -3,33 +3,28 @@ name: Registry Pull Rate Limit Benchmark
 on:
   workflow_dispatch:
     inputs:
-      runner_count:
-        description: Number of GitHub-hosted Ubuntu runners per phase
+      parallel_pulls:
+        description: Number of concurrent pull processes to start on a single runner
         required: true
         default: "100"
         type: string
-      max_parallel:
-        description: Max parallel jobs per phase
+      startup_delay_seconds:
+        description: Delay before the burst begins, so all worker processes can be ready first
         required: true
-        default: "100"
+        default: "30"
         type: string
       pull_timeout_seconds:
-        description: Timeout for each docker pull in seconds
+        description: Timeout for each individual pull process in seconds
         required: true
         default: "600"
         type: string
-      pull_probe_entrypoint:
-        description: Entrypoint used with docker run --pull always; override if the image does not provide /bin/true
-        required: true
-        default: "/bin/true"
-        type: string
       dockerhub_image:
-        description: Docker Hub image to test; prefer a pinned, less common image to reduce cache hits on hosted runners
+        description: Docker Hub image to test; prefer a pinned, less common image to reduce hosted-runner cache hits
         required: true
         default: "docker.io/library/erlang:27.3.4.1-slim"
         type: string
       ghcr_image:
-        description: GHCR image to test
+        description: GHCR image to test; this workflow mirrors the Docker Hub image here before benchmarking
         required: true
         default: "ghcr.io/gyohuangxin/registry-benchmark:erlang-27.3.4.1-slim"
         type: string
@@ -39,7 +34,7 @@ on:
         default: ""
         type: string
       fail_on_pull_error:
-        description: Mark workflow failed when any pull fails or is rate-limited
+        description: Mark the workflow failed when any pull fails or is rate-limited
         required: false
         default: false
         type: boolean
@@ -49,28 +44,45 @@ permissions:
   packages: write
 
 jobs:
-  prepare-matrix:
-    name: Prepare Matrix
+  single-runner-benchmark:
+    name: Single Runner Benchmark
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.prepare.outputs.matrix }}
-      runner_count: ${{ steps.prepare.outputs.runner_count }}
-      max_parallel: ${{ steps.prepare.outputs.max_parallel }}
-      pull_timeout_seconds: ${{ steps.prepare.outputs.pull_timeout_seconds }}
+    timeout-minutes: 120
+    env:
+      GHCR_PAT: ${{ secrets.GHCR_PAT }}
+      GHCR_USERNAME: ${{ inputs.ghcr_username || github.repository_owner }}
+      GHCR_WORKFLOW_USERNAME: ${{ github.actor }}
+      GHCR_WORKFLOW_TOKEN: ${{ github.token }}
+      DOCKERHUB_IMAGE: ${{ inputs.dockerhub_image }}
+      GHCR_IMAGE: ${{ inputs.ghcr_image }}
+      PARALLEL_PULLS: ${{ inputs.parallel_pulls }}
+      STARTUP_DELAY_SECONDS: ${{ inputs.startup_delay_seconds }}
+      PULL_TIMEOUT_SECONDS: ${{ inputs.pull_timeout_seconds }}
+      FAIL_ON_PULL_ERROR: ${{ inputs.fail_on_pull_error }}
     steps:
-      - name: Validate inputs and build matrix
-        id: prepare
+      - name: Install skopeo
         shell: bash
-        env:
-          RUNNER_COUNT: ${{ inputs.runner_count }}
-          MAX_PARALLEL: ${{ inputs.max_parallel }}
-          PULL_TIMEOUT_SECONDS: ${{ inputs.pull_timeout_seconds }}
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Capture runner egress IP
+        shell: bash
+        run: |
+          set -euo pipefail
+          egress_ip="$(curl -fsSL https://api.ipify.org || true)"
+          echo "RUNNER_EGRESS_IP=${egress_ip:-unknown}" >> "$GITHUB_ENV"
+          echo "Runner egress IP: ${egress_ip:-unknown}"
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
           import os
 
-          def parse_positive_int(name: str, raw: str) -> int:
+          def parse_positive_int(name: str) -> int:
+              raw = os.environ[name]
               try:
                   value = int(raw)
               except ValueError as exc:
@@ -79,40 +91,18 @@ jobs:
                   raise SystemExit(f"{name} must be >= 1, got {value}")
               return value
 
-          runner_count = parse_positive_int("runner_count", os.environ["RUNNER_COUNT"])
-          max_parallel = parse_positive_int("max_parallel", os.environ["MAX_PARALLEL"])
-          pull_timeout_seconds = parse_positive_int(
-              "pull_timeout_seconds",
-              os.environ["PULL_TIMEOUT_SECONDS"],
-          )
+          parallel_pulls = parse_positive_int("PARALLEL_PULLS")
+          startup_delay_seconds = parse_positive_int("STARTUP_DELAY_SECONDS")
+          pull_timeout_seconds = parse_positive_int("PULL_TIMEOUT_SECONDS")
 
-          if runner_count > 200:
-              raise SystemExit("runner_count must be <= 200 to avoid accidental quota spikes")
+          if parallel_pulls > 200:
+              raise SystemExit("PARALLEL_PULLS must be <= 200 to avoid accidental quota spikes")
 
-          if max_parallel > runner_count:
-              max_parallel = runner_count
-
-          matrix = {"runner_index": list(range(1, runner_count + 1))}
-          print(f"matrix={json.dumps(matrix)}")
-          print(f"runner_count={runner_count}")
-          print(f"max_parallel={max_parallel}")
-          print(f"pull_timeout_seconds={pull_timeout_seconds}")
+          print(f"PARALLEL_PULLS={parallel_pulls}")
+          print(f"STARTUP_DELAY_SECONDS={startup_delay_seconds}")
+          print(f"PULL_TIMEOUT_SECONDS={pull_timeout_seconds}")
           PY
 
-  sync-ghcr-image:
-    name: Sync Benchmark Image to GHCR
-    needs: prepare-matrix
-    runs-on: ubuntu-latest
-    outputs:
-      published_digest: ${{ steps.sync.outputs.published_digest }}
-    env:
-      GHCR_PAT: ${{ secrets.GHCR_PAT }}
-      GHCR_USERNAME: ${{ inputs.ghcr_username || github.repository_owner }}
-      GHCR_WORKFLOW_USERNAME: ${{ github.actor }}
-      GHCR_WORKFLOW_TOKEN: ${{ github.token }}
-      SRC_IMAGE: ${{ inputs.dockerhub_image }}
-      DST_IMAGE: ${{ inputs.ghcr_image }}
-    steps:
       - name: Log in to GHCR
         shell: bash
         run: |
@@ -127,298 +117,198 @@ jobs:
             echo "GHCR_PAT is not set; falling back to GITHUB_TOKEN for GHCR login."
           fi
 
-          printf '%s' "$login_password" | docker login ghcr.io -u "$login_user" --password-stdin
+          skopeo login --username "$login_user" --password "$login_password" ghcr.io
 
       - name: Mirror Docker Hub image into GHCR
-        id: sync
         shell: bash
         run: |
           set -euo pipefail
-          docker pull "$SRC_IMAGE"
-          docker tag "$SRC_IMAGE" "$DST_IMAGE"
-          docker push "$DST_IMAGE"
+          skopeo copy "docker://$DOCKERHUB_IMAGE" "docker://$GHCR_IMAGE"
+          digest="$(skopeo inspect --format '{{.Digest}}' "docker://$GHCR_IMAGE")"
+          echo "PREPARED_GHCR_DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "Prepared GHCR digest: $digest"
 
-          published_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$DST_IMAGE")
-          echo "published_digest=$published_digest" >> "$GITHUB_OUTPUT"
-          echo "Published GHCR digest: $published_digest"
-
-  dockerhub-pull:
-    name: Docker Hub Pull ${{ matrix.runner_index }}
-    needs:
-      - prepare-matrix
-      - sync-ghcr-image
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.prepare-matrix.outputs.max_parallel) }}
-      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
-    steps:
-      - name: Force-pull Docker Hub image and capture result
-        shell: bash
-        env:
-          IMAGE: ${{ inputs.dockerhub_image }}
-          REGISTRY_NAME: dockerhub
-          RUNNER_INDEX: ${{ matrix.runner_index }}
-          PULL_TIMEOUT_SECONDS: ${{ needs.prepare-matrix.outputs.pull_timeout_seconds }}
-          PULL_PROBE_ENTRYPOINT: ${{ inputs.pull_probe_entrypoint }}
-        run: |
-          set +e
-          rm -f pull.log "${REGISTRY_NAME}-result-${RUNNER_INDEX}.json"
-          docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
-
-          started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          start_epoch=$(date +%s)
-
-          timeout "${PULL_TIMEOUT_SECONDS}" docker run \
-            --pull always \
-            --rm \
-            --entrypoint "${PULL_PROBE_ENTRYPOINT}" \
-            "$IMAGE" 2>&1 | tee pull.log
-          pull_exit=${PIPESTATUS[0]}
-
-          end_epoch=$(date +%s)
-          duration_seconds=$((end_epoch - start_epoch))
-          digest=$(docker image inspect --format='{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null || true)
-
-          export STARTED_AT="$started_at"
-          export DURATION_SECONDS="$duration_seconds"
-          export PULL_EXIT="$pull_exit"
-          export DIGEST="$digest"
-
-          python - <<'PY'
-          import json
-          import os
-          import pathlib
-          import re
-
-          log_text = pathlib.Path("pull.log").read_text(encoding="utf-8", errors="replace")
-          log_lower = log_text.lower()
-          exit_code = int(os.environ["PULL_EXIT"])
-
-          rate_limited = bool(
-              re.search(
-                  r"toomanyrequests|rate limit|too many requests|you have reached your pull rate limit|429",
-                  log_lower,
-              )
-          )
-          unauthorized = bool(
-              re.search(
-                  r"unauthorized|authentication required|requested access to the resource is denied|denied",
-                  log_lower,
-              )
-          )
-          timeout_hit = exit_code == 124
-
-          result = {
-              "registry": os.environ["REGISTRY_NAME"],
-              "runner_index": int(os.environ["RUNNER_INDEX"]),
-              "image": os.environ["IMAGE"],
-              "started_at": os.environ["STARTED_AT"],
-              "duration_seconds": int(os.environ["DURATION_SECONDS"]),
-              "exit_code": exit_code,
-              "status": "success" if exit_code == 0 else "failure",
-              "rate_limited": rate_limited,
-              "unauthorized": unauthorized,
-              "timeout": timeout_hit,
-              "digest": os.environ.get("DIGEST", ""),
-              "error_excerpt": log_text[-4000:],
-          }
-
-          output_path = pathlib.Path(
-              f"{os.environ['REGISTRY_NAME']}-result-{os.environ['RUNNER_INDEX']}.json"
-          )
-          output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-          PY
-
-          if [ "$pull_exit" -ne 0 ]; then
-            echo "::warning::docker pull failed for $IMAGE on runner $RUNNER_INDEX"
-          fi
-
-      - name: Upload Docker Hub result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dockerhub-result-${{ matrix.runner_index }}
-          path: dockerhub-result-${{ matrix.runner_index }}.json
-
-  ghcr-pull:
-    name: GHCR Pull ${{ matrix.runner_index }}
-    needs:
-      - prepare-matrix
-      - sync-ghcr-image
-      - dockerhub-pull
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      GHCR_PAT: ${{ secrets.GHCR_PAT }}
-      GHCR_USERNAME: ${{ inputs.ghcr_username || secrets.GHCR_USERNAME || github.repository_owner }}
-      GHCR_WORKFLOW_USERNAME: ${{ github.actor }}
-      GHCR_WORKFLOW_TOKEN: ${{ github.token }}
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.prepare-matrix.outputs.max_parallel) }}
-      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
-    steps:
-      - name: Log in to GHCR
+      - name: Create benchmark helper
         shell: bash
         run: |
           set -euo pipefail
-          if [ -n "$GHCR_PAT" ]; then
-            login_user="$GHCR_USERNAME"
-            login_password="$GHCR_PAT"
-            echo "Using GHCR_PAT for GHCR login."
-          else
-            login_user="$GHCR_WORKFLOW_USERNAME"
-            login_password="$GHCR_WORKFLOW_TOKEN"
-            echo "GHCR_PAT is not set; falling back to GITHUB_TOKEN for GHCR login."
-          fi
-
-          printf '%s' "$login_password" | docker login ghcr.io -u "$login_user" --password-stdin
-
-      - name: Force-pull GHCR image and capture result
-        shell: bash
-        env:
-          IMAGE: ${{ inputs.ghcr_image }}
-          REGISTRY_NAME: ghcr
-          RUNNER_INDEX: ${{ matrix.runner_index }}
-          PULL_TIMEOUT_SECONDS: ${{ needs.prepare-matrix.outputs.pull_timeout_seconds }}
-          PULL_PROBE_ENTRYPOINT: ${{ inputs.pull_probe_entrypoint }}
-        run: |
-          set +e
-          rm -f pull.log "${REGISTRY_NAME}-result-${RUNNER_INDEX}.json"
-          docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
-
-          started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          start_epoch=$(date +%s)
-
-          timeout "${PULL_TIMEOUT_SECONDS}" docker run \
-            --pull always \
-            --rm \
-            --entrypoint "${PULL_PROBE_ENTRYPOINT}" \
-            "$IMAGE" 2>&1 | tee pull.log
-          pull_exit=${PIPESTATUS[0]}
-
-          end_epoch=$(date +%s)
-          duration_seconds=$((end_epoch - start_epoch))
-          digest=$(docker image inspect --format='{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null || true)
-
-          export STARTED_AT="$started_at"
-          export DURATION_SECONDS="$duration_seconds"
-          export PULL_EXIT="$pull_exit"
-          export DIGEST="$digest"
-
-          python - <<'PY'
+          mkdir -p "$GITHUB_WORKSPACE/registry-benchmark-results"
+          cat <<'PY' > "$GITHUB_WORKSPACE/registry-benchmark-results/run_burst.py"
           import json
-          import os
           import pathlib
           import re
+          import shlex
+          import shutil
+          import subprocess
+          import sys
+          import time
 
-          log_text = pathlib.Path("pull.log").read_text(encoding="utf-8", errors="replace")
-          log_lower = log_text.lower()
-          exit_code = int(os.environ["PULL_EXIT"])
 
-          rate_limited = bool(
-              re.search(
-                  r"toomanyrequests|rate limit|too many requests|you have reached your pull rate limit|429",
-                  log_lower,
+          registry = sys.argv[1]
+          image = sys.argv[2]
+          results_root = pathlib.Path(sys.argv[3])
+          parallel_pulls = int(sys.argv[4])
+          startup_delay_seconds = int(sys.argv[5])
+          pull_timeout_seconds = int(sys.argv[6])
+
+          registry_root = results_root / registry
+          logs_dir = registry_root / "logs"
+          work_dir = registry_root / "work"
+          logs_dir.mkdir(parents=True, exist_ok=True)
+          work_dir.mkdir(parents=True, exist_ok=True)
+
+          start_epoch = int(time.time()) + startup_delay_seconds
+          print(
+              f"[{registry}] scheduling {parallel_pulls} concurrent pulls at epoch {start_epoch}",
+              flush=True,
+          )
+
+          processes = []
+          rate_limit_pattern = re.compile(
+              r"toomanyrequests|rate limit|too many requests|you have reached your pull rate limit|429",
+              re.IGNORECASE,
+          )
+          unauthorized_pattern = re.compile(
+              r"unauthorized|authentication required|requested access to the resource is denied|denied",
+              re.IGNORECASE,
+          )
+
+          for index in range(1, parallel_pulls + 1):
+              log_path = logs_dir / f"{index}.log"
+              dest_dir = work_dir / f"{index}"
+              src_ref = shlex.quote(f"docker://{image}")
+              dest_ref = shlex.quote(f"dir:{dest_dir}")
+              dest_dir_quoted = shlex.quote(str(dest_dir))
+              script = f"""
+          set +e
+          mkdir -p {dest_dir_quoted}
+          while [ "$(date +%s)" -lt "{start_epoch}" ]; do
+            sleep 0.2
+          done
+          timeout "{pull_timeout_seconds}" skopeo copy {src_ref} {dest_ref}
+          status=$?
+          rm -rf {dest_dir_quoted}
+          exit "$status"
+          """
+              log_handle = log_path.open("w", encoding="utf-8")
+              process = subprocess.Popen(
+                  ["bash", "-lc", script],
+                  stdout=log_handle,
+                  stderr=subprocess.STDOUT,
               )
-          )
-          unauthorized = bool(
-              re.search(
-                  r"unauthorized|authentication required|requested access to the resource is denied|denied",
-                  log_lower,
+              processes.append(
+                  {
+                      "pull_index": index,
+                      "process": process,
+                      "log_path": log_path,
+                      "log_handle": log_handle,
+                  }
               )
-          )
-          timeout_hit = exit_code == 124
 
-          result = {
-              "registry": os.environ["REGISTRY_NAME"],
-              "runner_index": int(os.environ["RUNNER_INDEX"]),
-              "image": os.environ["IMAGE"],
-              "started_at": os.environ["STARTED_AT"],
-              "duration_seconds": int(os.environ["DURATION_SECONDS"]),
-              "exit_code": exit_code,
-              "status": "success" if exit_code == 0 else "failure",
-              "rate_limited": rate_limited,
-              "unauthorized": unauthorized,
-              "timeout": timeout_hit,
-              "digest": os.environ.get("DIGEST", ""),
-              "error_excerpt": log_text[-4000:],
-          }
+          results = []
+          remaining = processes
+          while remaining:
+              next_remaining = []
+              for item in remaining:
+                  exit_code = item["process"].poll()
+                  if exit_code is None:
+                      next_remaining.append(item)
+                      continue
 
-          output_path = pathlib.Path(
-              f"{os.environ['REGISTRY_NAME']}-result-{os.environ['RUNNER_INDEX']}.json"
+                  item["log_handle"].close()
+                  finished_at = int(time.time())
+                  log_text = item["log_path"].read_text(encoding="utf-8", errors="replace")
+                  results.append(
+                      {
+                          "registry": registry,
+                          "pull_index": item["pull_index"],
+                          "image": image,
+                          "status": "success" if exit_code == 0 else "failure",
+                          "exit_code": exit_code,
+                          "rate_limited": bool(rate_limit_pattern.search(log_text)),
+                          "unauthorized": bool(unauthorized_pattern.search(log_text)),
+                          "timeout": exit_code == 124,
+                          "duration_seconds": max(0, finished_at - start_epoch),
+                          "error_excerpt": log_text[-4000:],
+                      }
+                  )
+                  print(
+                      f"[{registry}] completed {len(results)}/{parallel_pulls} pulls",
+                      flush=True,
+                  )
+              remaining = next_remaining
+              if remaining:
+                  time.sleep(0.2)
+
+          results.sort(key=lambda record: record["pull_index"])
+          (registry_root / "results.json").write_text(
+              json.dumps(results, indent=2) + "\n",
+              encoding="utf-8",
           )
-          output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+          shutil.rmtree(work_dir, ignore_errors=True)
+
+          success_count = sum(1 for record in results if record["status"] == "success")
+          print(
+              f"[{registry}] finished with {success_count}/{len(results)} successful pulls",
+              flush=True,
+          )
           PY
 
-          if [ "$pull_exit" -ne 0 ]; then
-            echo "::warning::docker pull failed for $IMAGE on runner $RUNNER_INDEX"
-          fi
+      - name: Run Docker Hub burst
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/registry-benchmark-results/run_burst.py" \
+            dockerhub \
+            "$DOCKERHUB_IMAGE" \
+            "$GITHUB_WORKSPACE/registry-benchmark-results" \
+            "$PARALLEL_PULLS" \
+            "$STARTUP_DELAY_SECONDS" \
+            "$PULL_TIMEOUT_SECONDS"
 
-      - name: Upload GHCR result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ghcr-result-${{ matrix.runner_index }}
-          path: ghcr-result-${{ matrix.runner_index }}.json
-
-  summarize:
-    name: Summarize Results
-    needs:
-      - prepare-matrix
-      - sync-ghcr-image
-      - dockerhub-pull
-      - ghcr-pull
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Docker Hub results
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: dockerhub-result-*
-          path: dockerhub-results
-          merge-multiple: true
-
-      - name: Download GHCR results
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ghcr-result-*
-          path: ghcr-results
-          merge-multiple: true
+      - name: Run GHCR burst
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/registry-benchmark-results/run_burst.py" \
+            ghcr \
+            "$GHCR_IMAGE" \
+            "$GITHUB_WORKSPACE/registry-benchmark-results" \
+            "$PARALLEL_PULLS" \
+            "$STARTUP_DELAY_SECONDS" \
+            "$PULL_TIMEOUT_SECONDS"
 
       - name: Generate workflow summary
+        if: always()
         shell: bash
-        env:
-          EXPECTED_RUNNER_COUNT: ${{ needs.prepare-matrix.outputs.runner_count }}
-          DOCKERHUB_IMAGE: ${{ inputs.dockerhub_image }}
-          GHCR_IMAGE: ${{ inputs.ghcr_image }}
-          PREPARED_GHCR_DIGEST: ${{ needs.sync-ghcr-image.outputs.published_digest }}
-          FAIL_ON_PULL_ERROR: ${{ inputs.fail_on_pull_error }}
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import json
           import os
           import pathlib
 
-          expected = int(os.environ["EXPECTED_RUNNER_COUNT"])
+          results_root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "registry-benchmark-results"
           summary_path = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          parallel_pulls = int(os.environ["PARALLEL_PULLS"])
+          startup_delay_seconds = int(os.environ["STARTUP_DELAY_SECONDS"])
+          fail_on_pull_error = os.environ["FAIL_ON_PULL_ERROR"].lower() == "true"
 
-          def load_results(folder: str) -> list[dict]:
-              base = pathlib.Path(folder)
-              if not base.exists():
+          def load_results(registry: str) -> list[dict]:
+              path = results_root / registry / "results.json"
+              if not path.exists():
                   return []
-              records = []
-              for path in sorted(base.glob("*.json")):
-                  records.append(json.loads(path.read_text(encoding="utf-8")))
-              return records
+              return json.loads(path.read_text(encoding="utf-8"))
 
           def pick_excerpt(text: str) -> str:
               lines = [line.strip() for line in text.splitlines() if line.strip()]
-              keywords = ("toomanyrequests", "rate limit", "too many requests", "unauthorized", "denied", "error")
+              keywords = (
+                  "toomanyrequests",
+                  "rate limit",
+                  "too many requests",
+                  "unauthorized",
+                  "denied",
+                  "error",
+              )
               for keyword in keywords:
                   for line in lines:
                       if keyword in line.lower():
@@ -433,7 +323,9 @@ jobs:
                   "rate_limited": 0,
                   "unauthorized": 0,
                   "timeout": 0,
+                  "avg_duration_seconds": 0.0,
               }
+              durations = []
               for record in records:
                   if record.get("status") == "success":
                       stats["success"] += 1
@@ -445,36 +337,43 @@ jobs:
                       stats["unauthorized"] += 1
                   if record.get("timeout"):
                       stats["timeout"] += 1
-              stats["missing"] = max(expected - stats["reported"], 0)
+                  duration = record.get("duration_seconds")
+                  if isinstance(duration, (int, float)):
+                      durations.append(duration)
+              if durations:
+                  stats["avg_duration_seconds"] = round(sum(durations) / len(durations), 1)
               return stats
 
-          dockerhub_records = load_results("dockerhub-results")
-          ghcr_records = load_results("ghcr-results")
+          dockerhub_records = load_results("dockerhub")
+          ghcr_records = load_results("ghcr")
           dockerhub_stats = summarize(dockerhub_records)
           ghcr_stats = summarize(ghcr_records)
 
           lines = [
               "# Registry Pull Benchmark Summary",
               "",
-              f"Expected runners per phase: **{expected}**",
+              "Single-runner mode: Docker Hub and GHCR bursts ran on the same `ubuntu-latest` runner.",
+              f"Runner egress IP: `{os.environ.get('RUNNER_EGRESS_IP', 'unknown')}`",
+              f"Concurrent pull processes per registry: **{parallel_pulls}**",
+              f"Startup delay before each burst: **{startup_delay_seconds}s**",
               f"Prepared GHCR digest: `{os.environ.get('PREPARED_GHCR_DIGEST') or 'unavailable'}`",
               "",
-              "| Registry | Image | Reports | Success | Failure | Rate limited | Unauthorized | Timeout | Missing |",
+              "| Registry | Image | Reports | Success | Failure | Rate limited | Unauthorized | Timeout | Avg duration (s) |",
               "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
               (
                   f"| Docker Hub | `{os.environ['DOCKERHUB_IMAGE']}` | {dockerhub_stats['reported']} | "
                   f"{dockerhub_stats['success']} | {dockerhub_stats['failure']} | "
                   f"{dockerhub_stats['rate_limited']} | {dockerhub_stats['unauthorized']} | "
-                  f"{dockerhub_stats['timeout']} | {dockerhub_stats['missing']} |"
+                  f"{dockerhub_stats['timeout']} | {dockerhub_stats['avg_duration_seconds']} |"
               ),
               (
                   f"| GHCR | `{os.environ['GHCR_IMAGE']}` | {ghcr_stats['reported']} | "
                   f"{ghcr_stats['success']} | {ghcr_stats['failure']} | "
                   f"{ghcr_stats['rate_limited']} | {ghcr_stats['unauthorized']} | "
-                  f"{ghcr_stats['timeout']} | {ghcr_stats['missing']} |"
+                  f"{ghcr_stats['timeout']} | {ghcr_stats['avg_duration_seconds']} |"
               ),
               "",
-              "> Actual concurrency depends on your GitHub-hosted runner quota. Queued jobs do not affect the rate-limit counters, only completed pull attempts do.",
+              "> This mode keeps both registry bursts on one runner to share the same egress IP while avoiding Docker daemon cache sharing during the pull burst.",
               "",
           ]
 
@@ -488,7 +387,7 @@ jobs:
               for record in failures[:5]:
                   excerpt = pick_excerpt(record.get("error_excerpt", ""))
                   lines.append(
-                      f"- Runner {record['runner_index']}: exit={record['exit_code']}, "
+                      f"- Pull {record['pull_index']}: exit={record['exit_code']}, "
                       f"rate_limited={record['rate_limited']}, unauthorized={record['unauthorized']}, "
                       f"timeout={record['timeout']}, excerpt=`{excerpt}`"
                   )
@@ -501,14 +400,12 @@ jobs:
 
           summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-          should_fail = os.environ["FAIL_ON_PULL_ERROR"].lower() == "true" and any(
+          should_fail = fail_on_pull_error and any(
               [
                   dockerhub_stats["failure"],
                   dockerhub_stats["rate_limited"],
-                  dockerhub_stats["missing"],
                   ghcr_stats["failure"],
                   ghcr_stats["rate_limited"],
-                  ghcr_stats["missing"],
               ]
           )
           if should_fail:
